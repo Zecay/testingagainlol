@@ -15,12 +15,13 @@ export default function handler(req, res) {
   }
   // -----------------------------
 
-  const { id, x, y } = req.query;
+  const { id, x, y, name } = req.query;
   
   if (id && x && y) {
     players[id] = { 
       x: parseInt(x), 
       y: parseInt(y), 
+      name: name ? decodeURIComponent(name) : id, // Store incoming name payload strings safely
       t: Date.now() 
     };
   }
