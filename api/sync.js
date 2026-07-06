@@ -1,21 +1,14 @@
 // /api/sync.js – Vercel Serverless Function
-// Multiplayer sync: position, chat, username, minigame state
+// Multiplayer sync: position, chat, username, build system
 // In-memory only (resets on cold start)
 
 let players = {};
 let chatBuffer = [];
+let buildActions = [];       // { v, action, id, x,y,z, sx,sy,sz, rx,ry,rz, color, owner }
+let buildVersion = 0;
 const MAX_CHAT = 50;
-const PLAYER_TIMEOUT = 30000;   // 30s no ping → remove player
+const PLAYER_TIMEOUT = 30000;
 const MAX_POS = 5000;
-
-// Shared minigame state (reset on cold start)
-let minigameState = {
-    active: null,        // 'race' | 'tag' | 'hide' | null
-    taggerId: null,
-    seekerId: null,
-    raceFlag: null,      // { x, z }
-    startTime: 0,
-};
 
 const BAD_WORDS = /\b(nigga|fag|faggot|retard|kys|tranny|chink|spic)\b/i;
 function isBad(s) {
@@ -33,27 +26,11 @@ function isValidUsername(name) {
 
 function cleanup() {
     const now = Date.now();
-    let changed = false;
-
     for (const id in players) {
         if (now - players[id].lastSeen > PLAYER_TIMEOUT) {
             delete players[id];
-            changed = true;
         }
     }
-
-    // If minigame is active but tagger/seeker left, reset it
-    if (changed && minigameState.active) {
-        if (minigameState.taggerId && !players[minigameState.taggerId]) {
-            minigameState.active = null;
-            minigameState.taggerId = null;
-        }
-        if (minigameState.seekerId && !players[minigameState.seekerId]) {
-            minigameState.active = null;
-            minigameState.seekerId = null;
-        }
-    }
-
     // Trim old chat (keep last 15s)
     const cutoff = now - 15000;
     while (chatBuffer.length && chatBuffer[0].ts < cutoff) chatBuffer.shift();
@@ -74,16 +51,14 @@ export default async function handler(req, res) {
         const q = req.query || {};
         const p = { ...q, ...body };
 
-        let { id, username, name, x, y, z, chat, mg } = p;
+        let { id, username, name, x, y, z, chat, build } = p;
 
-        // Map 'name' query param to username
         if (!username && name) username = decodeURIComponent(name);
 
         if (!id || typeof id !== 'string') {
             return res.status(200).json({ ok: false, error: 'Missing id' });
         }
 
-        // Create player if new
         if (!players[id]) {
             players[id] = {
                 x: 0, y: 0, z: 0,
@@ -136,28 +111,49 @@ export default async function handler(req, res) {
             }
         }
 
-        // Minigame state updates (clients send mg={start:"race"} etc.)
-        if (typeof mg === 'string' && mg.trim() && pl.approved) {
+        // Build system - process build actions from clients
+        if (typeof build === 'string' && pl.approved) {
             try {
-                const mgData = JSON.parse(mg);
-                if (mgData.start && !minigameState.active) {
-                    minigameState.active = mgData.start;
-                    minigameState.startTime = Date.now();
-                    if (mgData.start === 'tag') {
-                        minigameState.taggerId = id;
-                    } else if (mgData.start === 'hide') {
-                        minigameState.seekerId = id;
-                    } else if (mgData.start === 'race') {
-                        minigameState.raceFlag = {
-                            x: (Math.random() - 0.5) * 40,
-                            z: (Math.random() - 0.5) * 40
-                        };
+                const bData = JSON.parse(build);
+                if (bData.action && bData.id) {
+                    buildVersion++;
+                    const record = { v: buildVersion, action: bData.action, id: bData.id };
+
+                    if (bData.action === 'add') {
+                        record.x = bData.x || 0;
+                        record.y = bData.y || 1;
+                        record.z = bData.z || 0;
+                        record.sx = bData.sx || 2;
+                        record.sy = bData.sy || 2;
+                        record.sz = bData.sz || 2;
+                        record.rx = bData.rx || 0;
+                        record.ry = bData.ry || 0;
+                        record.rz = bData.rz || 0;
+                        record.color = bData.color || 0x4CAF50;
+                        record.owner = id;
+                    } else if (bData.action === 'update') {
+                        record.x = bData.x; record.y = bData.y; record.z = bData.z;
+                        record.sx = bData.sx; record.sy = bData.sy; record.sz = bData.sz;
+                        record.rx = bData.rx; record.ry = bData.ry; record.rz = bData.rz;
+                        record.color = bData.color;
+                    }
+                    // For delete, just need the id
+
+                    buildActions.push(record);
+
+                    // Keep only last 500 build actions
+                    if (buildActions.length > 500) {
+                        buildActions = buildActions.slice(-500);
                     }
                 }
-            } catch (e) { /* ignore malformed mg */ }
+            } catch (e) { /* ignore bad build payload */ }
         }
 
-        // Build response: other players (exclude self)
+        // Build response: send all build actions since client's last version
+        const clientBuildV = parseInt(p.buildV) || 0;
+        const newBuilds = buildActions.filter(b => b.v > clientBuildV);
+
+        // Other players list
         const otherPlayers = {};
         for (const [pid, pdata] of Object.entries(players)) {
             if (pid !== id && pdata.approved) {
@@ -183,7 +179,8 @@ export default async function handler(req, res) {
             chatBlocked,
             players: otherPlayers,
             chat: recentChat,
-            minigame: minigameState.active ? { ...minigameState } : null
+            builds: newBuilds,
+            buildV: buildVersion
         });
 
     } catch (err) {
