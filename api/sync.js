@@ -1,15 +1,26 @@
-// /api/sync.js – Vercel Serverless – Multiplayer Sync for 3D Games
-// Supports: username approval, position sync (x, y, z), chat
-// In-memory only – resets on cold start
+// /api/sync.js – Vercel Serverless Function
+// Multiplayer sync: position, chat, username, minigame state
+// In-memory only (resets on cold start)
 
 let players = {};
 let chatBuffer = [];
-const MAX_CHAT_BUFFER = 50;
-const PLAYER_TIMEOUT = 20000;
+const MAX_CHAT = 50;
+const PLAYER_TIMEOUT = 30000;   // 30s no ping → remove player
 const MAX_POS = 5000;
 
-const BAD = /\b(nigga|fag|faggot|retard|kys|tranny|chink|spic)\b/i;
-function isBad(s) { return typeof s === 'string' && BAD.test(s.toLowerCase()); }
+// Shared minigame state (reset on cold start)
+let minigameState = {
+    active: null,        // 'race' | 'tag' | 'hide' | null
+    taggerId: null,
+    seekerId: null,
+    raceFlag: null,      // { x, z }
+    startTime: 0,
+};
+
+const BAD_WORDS = /\b(nigga|fag|faggot|retard|kys|tranny|chink|spic)\b/i;
+function isBad(s) {
+    return typeof s === 'string' && BAD_WORDS.test(s.toLowerCase());
+}
 
 function isValidUsername(name) {
     if (!name || !name.trim()) return { ok: false, reason: 'Username cannot be empty.' };
@@ -22,12 +33,28 @@ function isValidUsername(name) {
 
 function cleanup() {
     const now = Date.now();
+    let changed = false;
+
     for (const id in players) {
         if (now - players[id].lastSeen > PLAYER_TIMEOUT) {
             delete players[id];
+            changed = true;
         }
     }
-    // trim old chat messages
+
+    // If minigame is active but tagger/seeker left, reset it
+    if (changed && minigameState.active) {
+        if (minigameState.taggerId && !players[minigameState.taggerId]) {
+            minigameState.active = null;
+            minigameState.taggerId = null;
+        }
+        if (minigameState.seekerId && !players[minigameState.seekerId]) {
+            minigameState.active = null;
+            minigameState.seekerId = null;
+        }
+    }
+
+    // Trim old chat (keep last 15s)
     const cutoff = now - 15000;
     while (chatBuffer.length && chatBuffer[0].ts < cutoff) chatBuffer.shift();
 }
@@ -37,7 +64,7 @@ export default async function handler(req, res) {
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
     res.setHeader('Cache-Control', 'no-store');
-    
+
     if (req.method === 'OPTIONS') return res.status(204).end();
 
     try {
@@ -47,21 +74,19 @@ export default async function handler(req, res) {
         const q = req.query || {};
         const p = { ...q, ...body };
 
-        let { id, username, name, x, y, z, chat } = p;
+        let { id, username, name, x, y, z, chat, mg } = p;
 
-        // Client sends ?name= – map to username
+        // Map 'name' query param to username
         if (!username && name) username = decodeURIComponent(name);
 
         if (!id || typeof id !== 'string') {
             return res.status(200).json({ ok: false, error: 'Missing id' });
         }
 
-        // Create or update player
+        // Create player if new
         if (!players[id]) {
             players[id] = {
-                x: 0,
-                y: 0,
-                z: 0,
+                x: 0, y: 0, z: 0,
                 username: null,
                 approved: false,
                 color: '#' + Math.floor(Math.random() * 16777215).toString(16).padStart(6, '0'),
@@ -72,11 +97,10 @@ export default async function handler(req, res) {
         const pl = players[id];
         pl.lastSeen = Date.now();
 
-        // Position sync (x, y = horizontal, z = vertical height)
+        // Position sync
         const px = parseFloat(x);
         const py = parseFloat(y);
         const pz = parseFloat(z);
-
         if (Number.isFinite(px)) pl.x = Math.max(-MAX_POS, Math.min(MAX_POS, px));
         if (Number.isFinite(py)) pl.y = Math.max(-MAX_POS, Math.min(MAX_POS, py));
         if (Number.isFinite(pz)) pl.z = Math.max(-MAX_POS, Math.min(MAX_POS, pz));
@@ -107,12 +131,33 @@ export default async function handler(req, res) {
                         text: clean,
                         ts: Date.now()
                     });
-                    if (chatBuffer.length > MAX_CHAT_BUFFER) chatBuffer.shift();
+                    if (chatBuffer.length > MAX_CHAT) chatBuffer.shift();
                 }
             }
         }
 
-        // Build other players list (exclude self)
+        // Minigame state updates (clients send mg={start:"race"} etc.)
+        if (typeof mg === 'string' && mg.trim() && pl.approved) {
+            try {
+                const mgData = JSON.parse(mg);
+                if (mgData.start && !minigameState.active) {
+                    minigameState.active = mgData.start;
+                    minigameState.startTime = Date.now();
+                    if (mgData.start === 'tag') {
+                        minigameState.taggerId = id;
+                    } else if (mgData.start === 'hide') {
+                        minigameState.seekerId = id;
+                    } else if (mgData.start === 'race') {
+                        minigameState.raceFlag = {
+                            x: (Math.random() - 0.5) * 40,
+                            z: (Math.random() - 0.5) * 40
+                        };
+                    }
+                }
+            } catch (e) { /* ignore malformed mg */ }
+        }
+
+        // Build response: other players (exclude self)
         const otherPlayers = {};
         for (const [pid, pdata] of Object.entries(players)) {
             if (pid !== id && pdata.approved) {
@@ -128,7 +173,6 @@ export default async function handler(req, res) {
         }
 
         const now = Date.now();
-        // Get recent chat messages (last 10 seconds, exclude own messages)
         const recentChat = chatBuffer.filter(m => m.ts > now - 10000 && m.id !== id);
 
         res.status(200).json({
@@ -138,7 +182,8 @@ export default async function handler(req, res) {
             usernameRejected,
             chatBlocked,
             players: otherPlayers,
-            chat: recentChat
+            chat: recentChat,
+            minigame: minigameState.active ? { ...minigameState } : null
         });
 
     } catch (err) {
