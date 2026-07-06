@@ -4,16 +4,17 @@
 // --- IN-MEMORY STATE (resets when function goes cold) ---
 // worlds: { [worldName]: { players: {}, blocks: {}, chat: [] } }
 let worlds = {};
+
 const BLOCK_TYPES = [
-  { id: 0, name: 'Air', color: '#1a1a2e', solid: false },
-  { id: 1, name: 'Grass', color: '#4a7c59', solid: true },
-  { id: 2, name: 'Dirt', color: '#8B5E3C', solid: true },
-  { id: 3, name: 'Stone', color: '#6B6B6B', solid: true },
-  { id: 4, name: 'Wood', color: '#8B6B3C', solid: true },
-  { id: 5, name: 'Brick', color: '#B85C3C', solid: true },
-  { id: 6, name: 'Glass', color: '#88CCEE', solid: true },
-  { id: 7, name: 'Gold', color: '#FFD700', solid: true },
-  { id: 8, name: 'Lava', color: '#FF4400', solid: false },
+  { id: 0, name: 'Air',   color: '#1a1a2e', solid: false },
+  { id: 1, name: 'Grass', color: '#4a7c59', solid: true  },
+  { id: 2, name: 'Dirt',  color: '#8B5E3C', solid: true  },
+  { id: 3, name: 'Stone', color: '#6B6B6B', solid: true  },
+  { id: 4, name: 'Wood',  color: '#8B6B3C', solid: true  },
+  { id: 5, name: 'Brick', color: '#B85C3C', solid: true  },
+  { id: 6, name: 'Glass', color: '#88CCEE', solid: true  },
+  { id: 7, name: 'Gold',  color: '#FFD700', solid: true  },
+  { id: 8, name: 'Lava',  color: '#FF4400', solid: false },
 ];
 
 const CHAT_MAX = 50;
@@ -181,15 +182,15 @@ export default function handler(req, res) {
         const bx = parseInt(blockX);
         const by = parseInt(blockY);
         const bt = parseInt(blockType);
-        
+
         if (isNaN(bx) || isNaN(by) || isNaN(bt)) {
           res.status(400).json({ error: 'Invalid block coordinates or type' });
           return;
         }
-        
+
         const w = worlds[world];
         const key = `${bx},${by}`;
-        
+
         if (bt === 0) {
           // Break block (set to air)
           delete w.blocks[key];
@@ -197,17 +198,17 @@ export default function handler(req, res) {
           // Place block
           w.blocks[key] = bt;
         }
-        
+
         // Broadcast to chat
         const playerName = name ? decodeURIComponent(name) : id;
-        const action = bt === 0 ? 'broke' : 'placed';
-        const blockName = bt === 0 ? 'a block' : BLOCK_TYPES.find(b => b.id === bt)?.name || 'block';
+        const actionVerb = bt === 0 ? 'broke' : 'placed';
+        const blockName = bt === 0 ? 'a block' : (BLOCK_TYPES.find(b => b.id === bt)?.name || 'block');
         w.chat.push({
-          text: `${playerName} ${action} ${blockName}`,
+          text: `${playerName} ${actionVerb} ${blockName}`,
           time: Date.now()
         });
         if (w.chat.length > CHAT_MAX) w.chat.shift();
-        
+
         res.status(200).json({ success: true });
         return;
       }
@@ -235,7 +236,7 @@ export default function handler(req, res) {
       }
 
       default:
-        res.status(200).json({ 
+        res.status(200).json({
           status: 'Growtopia-like Sandbox MMO',
           worlds: Object.keys(worlds).length,
           actions: ['sync', 'listWorlds', 'createWorld', 'getBlocks', 'setBlock', 'sendChat']
