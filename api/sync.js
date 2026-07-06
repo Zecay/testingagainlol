@@ -1,109 +1,175 @@
-// api/sync.js — Simple 2D top-down multiplayer sync server
-// Vercel Serverless Function (Node)
-// 
-// Client sends (GET):
-//   ?id=<playerId>&name=<urlEncodedName>&x=<int>&y=<int>&hat=<id>&credits=<int>&_t=<cacheBuster>
-// Server returns:
-//   { "<playerId>": { x, y, name, hat, credits, playTimeMs, t }, ... }
-//
-// WARNING: In-memory only. Resets on cold start, and Vercel may run multiple instances.
-// For production use Cloudflare Durable Objects.
+// /api/sync.js – Vercel Serverless – port of Zecay/multiplayer-server POST /api/sync
+// Compatible with Hangout Online / GridSphere polling client
+// Supports: move, username approval, hat, credits, playTimeMs, ownedCharacters, chat, PM
+// In-memory only – resets on cold start
 
 let players = {};
+let chatBuffer = [];
+let pmBuffers = {}; // { playerId: [ {from, fromUsername, text, ts} ] }
 
-const PLAYER_TIMEOUT = 5000; // Drop players we haven't heard from in 5s
-const MAX_NAME_LEN = 25;
-const MAX_PLAYERS = 200;
+const MAX_CHAT_BUFFER = 50;
+const MAX_PM_BUFFER = 30;
+const PLAYER_TIMEOUT = 15000;
+const MAX_POS = 5000;
 
-function sanitizeString(s, max = 32) {
-  if (typeof s !== 'string') return '';
-  return s.slice(0, max).replace(/[<>]/g, '');
+const ALLOWED_HATS = new Set([
+  'character1','character2','character3','character4','character5',
+  'character6','character7','character8','character9','character10', null
+]);
+
+// very light profanity – replace with bad-words if you bundle it
+const BAD = /\b(nigga|fag|faggot|retard|kys|tranny|chink|spic)\b/i;
+function isBad(s){ return typeof s==='string' && BAD.test(s.toLowerCase()); }
+
+function isValidUsername(name){
+  if(!name || !name.trim()) return {ok:false, reason:'Username cannot be empty.'};
+  const n = name.trim();
+  if(n.length>25) return {ok:false, reason:'Username is too long.'};
+  if(!/^[a-zA-Z0-9_ ]+$/.test(n)) return {ok:false, reason:'Only letters, numbers, underscores and spaces allowed.'};
+  if(isBad(n)) return {ok:false, reason:'That username is not allowed.'};
+  return {ok:true};
 }
 
-export default function handler(req, res) {
-  // --- CORS ---
+function cleanup(){
+  const now = Date.now();
+  for(const id in players){
+    if(now - players[id].lastSeen > PLAYER_TIMEOUT){
+      delete players[id];
+      delete pmBuffers[id];
+    }
+  }
+  // trim chat
+  const cutoff = now - 10000;
+  while(chatBuffer.length && chatBuffer[0].ts < cutoff) chatBuffer.shift();
+}
+
+export default async function handler(req, res){
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-  res.setHeader('Vary', 'Origin');
+  res.setHeader('Cache-Control', 'no-store');
+  if(req.method==='OPTIONS') return res.status(204).end();
 
-  if (req.method === 'OPTIONS') {
-    res.status(200).end();
-    return;
-  }
+  try{
+    cleanup();
 
-  try {
-    // support GET ?query and POST JSON body
-    const src = req.method === 'POST' ? { ...req.query, ...req.body } : req.query;
-    const { id, name, x, y, hat, credits, playTimeMs } = src || {};
+    // accept GET query or POST json
+    const body = req.method==='POST' ? (req.body || {}) : {};
+    const q = req.query || {};
+    const p = {...q, ...body};
 
-    const now = Date.now();
+    let { id, username, name, x, y, hat, credits, playTimeMs, ownedCharacters, chat, pmTo, pmText } = p;
+    // client sends ?name=  – map to username
+    if(!username && name) username = decodeURIComponent(name);
 
-    // --- UPDATE / REGISTER THIS PLAYER ---
-    if (id && typeof id === 'string' && id.length <= 64) {
-      const px = parseInt(x, 10);
-      const py = parseInt(y, 10);
+    if(!id || typeof id!=='string') {
+      // still return world state so client can see players even before registering
+      return res.status(200).json({ ok:false, error:'Missing id' });
+    }
 
-      if (!Number.isNaN(px) && !Number.isNaN(py)) {
-        const prev = players[id] || {};
+    if(!players[id]){
+      players[id] = {
+        x:0, y:0, username:null, approved:false,
+        color:'#4fc3f7', hat:null, credits:0, playTimeMs:0,
+        ownedCharacters:['character1','character2'],
+        lastSeen: Date.now()
+      };
+    }
+    const pl = players[id];
+    pl.lastSeen = Date.now();
 
-        // simple rate limiting / anti-teleport:
-        // if (prev.x !== undefined) {
-        //   const dist = Math.hypot(px - prev.x, py - prev.y);
-        //   if (dist > 800) { /* reject */ }
-        // }
+    // position
+    const px = parseFloat(x), py = parseFloat(y);
+    if(Number.isFinite(px)) pl.x = Math.max(-MAX_POS, Math.min(MAX_POS, px));
+    if(Number.isFinite(py)) pl.y = Math.max(-MAX_POS, Math.min(MAX_POS, py));
 
-        players[id] = {
-          x: px,
-          y: py,
-          name: name
-            ? sanitizeString(decodeURIComponent(name), MAX_NAME_LEN)
-            : (prev.name || id.slice(0, 12)),
-          hat: hat ? sanitizeString(hat, 32) : (prev.hat || 'character1'),
-          credits: Number.isFinite(+credits) ? Math.max(0, Math.floor(+credits)) : (prev.credits || 0),
-          playTimeMs: Number.isFinite(+playTimeMs) ? Math.max(0, Math.floor(+playTimeMs)) : (prev.playTimeMs || 0),
-          t: now
-        };
+    // username approval
+    let usernameRejected = null;
+    if(typeof username==='string' && username.trim() && !pl.approved){
+      const r = isValidUsername(username);
+      if(r.ok){ pl.username = username.trim(); pl.approved = true; }
+      else { usernameRejected = r.reason; }
+    }
 
-        // cap player count (FIFO evict oldest)
-        const pids = Object.keys(players);
-        if (pids.length > MAX_PLAYERS) {
-          pids.sort((a,b) => players[a].t - players[b].t);
-          for (let i = 0; i < pids.length - MAX_PLAYERS; i++) {
-            delete players[pids[i]];
-          }
+    // hat
+    if(hat!==undefined && (hat===null || ALLOWED_HATS.has(hat))) pl.hat = hat;
+    // credits / playtime / owned
+    if(Number.isFinite(+credits)) pl.credits = Math.max(0, Math.floor(+credits));
+    if(Number.isFinite(+playTimeMs)) pl.playTimeMs = Math.max(0, Math.floor(+playTimeMs));
+    if(Array.isArray(ownedCharacters)){
+      pl.ownedCharacters = [...new Set(ownedCharacters.filter(v=>typeof v==='string'&&v))].slice(0,20);
+    } else if(typeof ownedCharacters==='string' && ownedCharacters){
+      // support comma list ?owned=character1,character2
+      pl.ownedCharacters = ownedCharacters.split(',').filter(Boolean).slice(0,20);
+    }
+
+    // chat
+    let chatBlocked = false;
+    if(typeof chat==='string' && chat.trim() && pl.approved){
+      const clean = chat.trim().slice(0,140);
+      if(clean){
+        if(isBad(clean)){ chatBlocked = true; }
+        else {
+          chatBuffer.push({ id, username: pl.username||'Player', text: clean, ts: Date.now() });
+          if(chatBuffer.length > MAX_CHAT_BUFFER) chatBuffer.shift();
         }
       }
     }
 
-    // --- CLEAN UP STALE PLAYERS ---
-    for (const pid in players) {
-      if (now - players[pid].t > PLAYER_TIMEOUT) {
-        delete players[pid];
+    // PM
+    let pmError = null;
+    if(pmTo && typeof pmText==='string' && pmText.trim() && pl.approved){
+      const clean = pmText.trim().slice(0,300);
+      const target = players[pmTo];
+      if(!target || !target.approved){
+        pmError = 'That player is no longer online.';
+      } else {
+        const msg = { from:id, fromUsername: pl.username||'Player', text:clean, ts:Date.now() };
+        if(!pmBuffers[pmTo]) pmBuffers[pmTo]=[];
+        pmBuffers[pmTo].push(msg);
+        if(pmBuffers[pmTo].length > MAX_PM_BUFFER) pmBuffers[pmTo].shift();
+        // echo to sender
+        if(!pmBuffers[id]) pmBuffers[id]=[];
+        pmBuffers[id].push({...msg, isSelf:true});
+        if(pmBuffers[id].length > MAX_PM_BUFFER) pmBuffers[id].shift();
       }
     }
 
-    // --- BUILD RESPONSE (strip internal timestamp if you want, I leave t for client debugging) ---
-    const out = {};
-    for (const pid in players) {
-      const p = players[pid];
-      out[pid] = {
-        x: p.x,
-        y: p.y,
-        name: p.name,
-        hat: p.hat,
-        credits: p.credits,
-        playTimeMs: p.playTimeMs,
-        // t: p.t  // uncomment if client needs it
-      };
+    // build otherPlayers
+    const otherPlayers = {};
+    for(const [pid, pdata] of Object.entries(players)){
+      if(pid!==id && pdata.approved){
+        otherPlayers[pid] = {
+          username: pdata.username,
+          name: pdata.username, // compat
+          x: pdata.x, y: pdata.y,
+          hat: pdata.hat,
+          color: pdata.color,
+          credits: pdata.credits,
+          playTimeMs: pdata.playTimeMs,
+          ownedCharacters: pdata.ownedCharacters
+        };
+      }
     }
 
-    // Prevent any caching
-    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
-    res.setHeader('Content-Type', 'application/json; charset=utf-8');
-    res.status(200).json(out);
+    const now = Date.now();
+    const recentChat = chatBuffer.filter(m => m.ts > now-3000 && m.id !== id);
+    const myPMs = pmBuffers[id] ? pmBuffers[id].splice(0) : [];
+    if(pmBuffers[id] && !pmBuffers[id].length) delete pmBuffers[id];
 
-  } catch (err) {
-    res.status(500).json({ error: err.message || 'sync error' });
+    res.status(200).json({
+      ok: true,
+      myId: id,
+      usernameApproved: !!pl.approved,
+      usernameRejected,
+      chatBlocked,
+      pmError,
+      players: otherPlayers,
+      chat: recentChat,
+      pms: myPMs
+    });
+
+  }catch(err){
+    res.status(500).json({ ok:false, error: err.message });
   }
 }
