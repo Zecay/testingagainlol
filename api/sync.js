@@ -1,6 +1,5 @@
 // /api/sync.js – Vercel Serverless Function
-// Multiplayer sync: position, chat, username
-// In-memory only (resets on cold start)
+// Multiplayer sync: position, chat, username, playtime, profile
 
 let players = {};
 let chatBuffer = [];
@@ -48,7 +47,7 @@ export default async function handler(req, res) {
         const q = req.query || {};
         const p = { ...q, ...body };
 
-        let { id, username, name, x, y, z, chat } = p;
+        let { id, username, name, x, y, z, chat, playtime, avatarColor, profileUpdate, newUsername, newAvatarColor } = p;
 
         if (!username && name) username = decodeURIComponent(name);
 
@@ -62,6 +61,8 @@ export default async function handler(req, res) {
                 username: null,
                 approved: false,
                 color: '#' + Math.floor(Math.random() * 16777215).toString(16).padStart(6, '0'),
+                avatarColor: '#3498db',
+                playtime: 0,
                 lastSeen: Date.now()
             };
         }
@@ -77,6 +78,15 @@ export default async function handler(req, res) {
         if (Number.isFinite(py)) pl.y = Math.max(-MAX_POS, Math.min(MAX_POS, py));
         if (Number.isFinite(pz)) pl.z = Math.max(-MAX_POS, Math.min(MAX_POS, pz));
 
+        // Playtime sync
+        const pt = parseInt(playtime);
+        if (Number.isFinite(pt) && pt >= 0) pl.playtime = pt;
+
+        // Avatar color sync
+        if (typeof avatarColor === 'string' && /^#[0-9a-fA-F]{6}$/.test(avatarColor)) {
+            pl.avatarColor = avatarColor;
+        }
+
         // Username approval
         let usernameRejected = null;
         if (typeof username === 'string' && username.trim() && !pl.approved) {
@@ -86,6 +96,24 @@ export default async function handler(req, res) {
                 pl.approved = true;
             } else {
                 usernameRejected = r.reason;
+            }
+        }
+
+        // Profile update (name/avatar change after initial join)
+        let profileUpdateResult = null;
+        if (profileUpdate === '1' && pl.approved) {
+            if (typeof newUsername === 'string' && newUsername.trim()) {
+                const r = isValidUsername(newUsername);
+                if (r.ok) {
+                    pl.username = newUsername.trim();
+                    profileUpdateResult = { ok: true, newUsername: pl.username };
+                } else {
+                    profileUpdateResult = { ok: false, error: r.reason };
+                }
+            }
+            if (typeof newAvatarColor === 'string' && /^#[0-9a-fA-F]{6}$/.test(newAvatarColor)) {
+                pl.avatarColor = newAvatarColor;
+                if (!profileUpdateResult) profileUpdateResult = { ok: true };
             }
         }
 
@@ -117,7 +145,9 @@ export default async function handler(req, res) {
                     x: pdata.x,
                     y: pdata.y,
                     z: pdata.z,
-                    color: pdata.color
+                    color: pdata.color,
+                    avatarColor: pdata.avatarColor,
+                    playtime: pdata.playtime
                 };
             }
         }
@@ -132,7 +162,9 @@ export default async function handler(req, res) {
             usernameRejected,
             chatBlocked,
             players: otherPlayers,
-            chat: recentChat
+            chat: recentChat,
+            myPlaytime: pl.playtime,
+            profileUpdate: profileUpdateResult
         });
 
     } catch (err) {
