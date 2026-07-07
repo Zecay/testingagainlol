@@ -9,6 +9,9 @@ let buildVersion = 0;
 const MAX_CHAT = 50;
 const PLAYER_TIMEOUT = 30000;
 const MAX_POS = 5000;
+const BUILD_COOLDOWN_MS = 1000;
+
+const buildCooldowns = {};   // id -> lastBuildTime
 
 const BAD_WORDS = /\b(nigga|fag|faggot|retard|kys|tranny|chink|spic)\b/i;
 function isBad(s) {
@@ -29,9 +32,9 @@ function cleanup() {
     for (const id in players) {
         if (now - players[id].lastSeen > PLAYER_TIMEOUT) {
             delete players[id];
+            delete buildCooldowns[id];
         }
     }
-    // Trim old chat (keep last 15s)
     const cutoff = now - 15000;
     while (chatBuffer.length && chatBuffer[0].ts < cutoff) chatBuffer.shift();
 }
@@ -111,49 +114,61 @@ export default async function handler(req, res) {
             }
         }
 
-        // Build system - process build actions from clients
+        // Build system
+        let buildCooldown = false;
         if (typeof build === 'string' && pl.approved) {
-            try {
-                const bData = JSON.parse(build);
-                if (bData.action && bData.id) {
-                    buildVersion++;
-                    const record = { v: buildVersion, action: bData.action, id: bData.id };
+            const now = Date.now();
+            if (now - (buildCooldowns[id] || 0) < BUILD_COOLDOWN_MS) {
+                buildCooldown = true;
+            } else {
+                try {
+                    const bData = JSON.parse(build);
+                    if (bData.action && bData.id) {
+                        // Only owner may update or delete a build
+                        let isOwner = true;
+                        if (bData.action === 'update' || bData.action === 'delete') {
+                            const last = [...buildActions].reverse().find(b => b.id === bData.id);
+                            if (last && last.owner !== id) isOwner = false;
+                        }
 
-                    if (bData.action === 'add') {
-                        record.x = bData.x || 0;
-                        record.y = bData.y || 1;
-                        record.z = bData.z || 0;
-                        record.sx = bData.sx || 2;
-                        record.sy = bData.sy || 2;
-                        record.sz = bData.sz || 2;
-                        record.rx = bData.rx || 0;
-                        record.ry = bData.ry || 0;
-                        record.rz = bData.rz || 0;
-                        record.color = bData.color || 0x4CAF50;
-                        record.owner = id;
-                    } else if (bData.action === 'update') {
-                        record.x = bData.x; record.y = bData.y; record.z = bData.z;
-                        record.sx = bData.sx; record.sy = bData.sy; record.sz = bData.sz;
-                        record.rx = bData.rx; record.ry = bData.ry; record.rz = bData.rz;
-                        record.color = bData.color;
+                        if (isOwner) {
+                            buildVersion++;
+                            const record = { v: buildVersion, action: bData.action, id: bData.id, owner: id };
+
+                            if (bData.action === 'add') {
+                                record.x = Number(bData.x) || 0;
+                                record.y = Number(bData.y) || 1;
+                                record.z = Number(bData.z) || 0;
+                                record.sx = Number(bData.sx) || 2;
+                                record.sy = Number(bData.sy) || 2;
+                                record.sz = Number(bData.sz) || 2;
+                                record.rx = Number(bData.rx) || 0;
+                                record.ry = Number(bData.ry) || 0;
+                                record.rz = Number(bData.rz) || 0;
+                                record.color = bData.color || 0x4CAF50;
+                            } else if (bData.action === 'update') {
+                                record.x = bData.x; record.y = bData.y; record.z = bData.z;
+                                record.sx = bData.sx; record.sy = bData.sy; record.sz = bData.sz;
+                                record.rx = bData.rx; record.ry = bData.ry; record.rz = bData.rz;
+                                record.color = bData.color;
+                            }
+                            // delete only needs id
+
+                            buildActions.push(record);
+                            buildCooldowns[id] = now;
+
+                            if (buildActions.length > 500) {
+                                buildActions = buildActions.slice(-500);
+                            }
+                        }
                     }
-                    // For delete, just need the id
-
-                    buildActions.push(record);
-
-                    // Keep only last 500 build actions
-                    if (buildActions.length > 500) {
-                        buildActions = buildActions.slice(-500);
-                    }
-                }
-            } catch (e) { /* ignore bad build payload */ }
+                } catch (e) { /* ignore bad build payload */ }
+            }
         }
 
-        // Build response: send all build actions since client's last version
         const clientBuildV = parseInt(p.buildV) || 0;
         const newBuilds = buildActions.filter(b => b.v > clientBuildV);
 
-        // Other players list
         const otherPlayers = {};
         for (const [pid, pdata] of Object.entries(players)) {
             if (pid !== id && pdata.approved) {
@@ -177,6 +192,7 @@ export default async function handler(req, res) {
             usernameApproved: !!pl.approved,
             usernameRejected,
             chatBlocked,
+            buildCooldown,
             players: otherPlayers,
             chat: recentChat,
             builds: newBuilds,
