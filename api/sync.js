@@ -7,7 +7,8 @@
 let players = {};
 let chatBuffer = [];
 const MAX_CHAT = 50;
-const PLAYER_TIMEOUT = 30000;
+// REST is fallback-only; stale fallback players should disappear promptly.
+const PLAYER_TIMEOUT = 8000;
 const SETTINGS_TIMEOUT = 1000 * 60 * 60;
 const MAX_POS = 5000;
 let chatCounter = 0;
@@ -194,7 +195,11 @@ export default async function handler(req, res) {
         const q = req.query || {};
         const p = { ...q, ...body };
 
-        let { id, username, name, x, y, z, chat, displayName, avatar, adminAction, target, reason } = p;
+        let {
+            id, username, name, x, y, z, vx, vy, vz, yaw, seq, protocol,
+            chat, displayName, avatar, adminAction, target, reason, compact, since
+        } = p;
+        compact = compact === true || compact === 'true' || compact === 1 || compact === '1';
 
         if (!username && name) { try { username = decodeURIComponent(name); } catch { username = name; } }
         if (displayName) { try { displayName = decodeURIComponent(displayName); } catch {} }
@@ -212,6 +217,9 @@ export default async function handler(req, res) {
         if (!players[id]) {
             players[id] = {
                 x: 0, y: 0, z: 0,
+                vx: 0, vy: 0, vz: 0,
+                yaw: 0, seq: 0, protocol: 1,
+                session: 'rest-' + now.toString(36),
                 username: null,
                 displayName: null,
                 avatar: null,
@@ -233,10 +241,21 @@ export default async function handler(req, res) {
         if (pl.playtimeLastUpdate) pl.playtime += now - pl.playtimeLastUpdate;
         pl.playtimeLastUpdate = now;
 
+        const round3 = value => Math.round(value * 1000) / 1000;
+        const clampPos = value => round3(Math.max(-MAX_POS, Math.min(MAX_POS, value)));
+        const clampVelocity = value => round3(Math.max(-80, Math.min(80, value)));
         const px = parseFloat(x), py = parseFloat(y), pz = parseFloat(z);
-        if (Number.isFinite(px)) pl.x = Math.max(-MAX_POS, Math.min(MAX_POS, px));
-        if (Number.isFinite(py)) pl.y = Math.max(-MAX_POS, Math.min(MAX_POS, py));
-        if (Number.isFinite(pz)) pl.z = Math.max(-MAX_POS, Math.min(MAX_POS, pz));
+        const pvx = parseFloat(vx), pvy = parseFloat(vy), pvz = parseFloat(vz);
+        const pyaw = parseFloat(yaw), pseq = parseInt(seq, 10), pprotocol = parseInt(protocol, 10);
+        if (Number.isFinite(px)) pl.x = clampPos(px);
+        if (Number.isFinite(py)) pl.y = clampPos(py);
+        if (Number.isFinite(pz)) pl.z = clampPos(pz);
+        if (Number.isFinite(pvx)) pl.vx = clampVelocity(pvx);
+        if (Number.isFinite(pvy)) pl.vy = clampVelocity(pvy);
+        if (Number.isFinite(pvz)) pl.vz = clampVelocity(pvz);
+        if (Number.isFinite(pyaw)) pl.yaw = round3(pyaw);
+        if (Number.isFinite(pseq)) pl.seq = pseq;
+        if (pprotocol === 2) pl.protocol = 2;
 
         let usernameRejected = null;
         if (typeof username === 'string' && username.trim()) {
@@ -413,16 +432,34 @@ export default async function handler(req, res) {
                 username: pdata.username,
                 displayName: pdata.displayName || pdata.username,
                 name: pdata.displayName || pdata.username,
-                avatar: pdata.avatar || (avatarStore[pid] ? avatarStore[pid].avatar : null),
+                // Full avatars are bootstrap-only. Compact fallback polls reuse the
+                // avatar cached by the browser instead of downloading it every frame.
+                avatar: compact ? null : (pdata.avatar || (avatarStore[pid] ? avatarStore[pid].avatar : null)),
                 x: pdata.x, y: pdata.y, z: pdata.z,
+                vx: pdata.vx || 0, vy: pdata.vy || 0, vz: pdata.vz || 0,
+                yaw: pdata.yaw || 0,
+                seq: pdata.seq || 0,
+                protocol: pdata.protocol || 1,
+                session: pdata.session,
                 color: pdata.color,
                 playtime: pdata.playtime
             };
         }
 
-        let recentChat = chatBuffer.filter(m => m.ts > now - 10000 && m.id !== id).map(m => ({ mid: m.mid, id: m.id, username: m.username, avatar: m.avatar, text: m.text, ts: m.ts }));
+        const requestedSince = Number(since);
+        const chatSince = Number.isFinite(requestedSince) && requestedSince > 0
+            ? Math.max(now - 10000, requestedSince)
+            : now - 10000;
+        let recentChat = chatBuffer.filter(m => m.ts > chatSince && m.id !== id).map(m => ({
+            mid: m.mid,
+            id: m.id,
+            username: m.username,
+            avatar: compact ? null : m.avatar,
+            text: m.text,
+            ts: m.ts
+        }));
         try {
-            const supabaseChats = await tryGetRecentChatsSupabase(now - 10000);
+            const supabaseChats = await tryGetRecentChatsSupabase(chatSince);
             if (supabaseChats.length > 0) {
                 const existingKeys = new Set(recentChat.map(c => `${c.username}:${c.text}:${Math.floor(c.ts/2000)}`));
                 const existingMids = new Set(recentChat.map(c => c.mid));
@@ -446,8 +483,10 @@ export default async function handler(req, res) {
             chatBlocked,
             myPlaytime: pl.playtime,
             displayName: pl.displayName || (nameStore[id] ? nameStore[id].displayName : null),
-            avatar: pl.avatar || (avatarStore[id] ? avatarStore[id].avatar : null),
+            avatar: compact ? null : (pl.avatar || (avatarStore[id] ? avatarStore[id].avatar : null)),
             is_admin: pl.username ? await checkIsAdminSupabase(pl.username.toLowerCase()) : false,
+            serverTime: now,
+            protocol: 2,
             players: otherPlayers,
             chat: recentChat
         });
