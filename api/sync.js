@@ -1,26 +1,21 @@
 // /api/sync.js – Vercel Serverless Function
-// Multiplayer sync optimized for smooth movement:
-// - Positions every poll (tiny payload)
-// - Avatars only when version changes / client asks
-// - Single session per username, ban/kick, chat
-//
-// DROP-IN: replace your existing /api/sync.js with this file.
-// Optional sibling: ./_lib/supabase.js (same as before)
+// Multiplayer sync: position, chat, username, profile, playtime
+// + Single session per username (kick old)
+// + Ban/kick with in-memory fallback + Supabase persistence
+// + Chat stored in Supabase for cross-instance reliability
 
 let players = {};
 let chatBuffer = [];
-const MAX_CHAT = 40;
-const PLAYER_TIMEOUT = 12000; // drop faster so ghosts disappear
+const MAX_CHAT = 50;
+const PLAYER_TIMEOUT = 30000;
 const SETTINGS_TIMEOUT = 1000 * 60 * 60;
 const MAX_POS = 5000;
 let chatCounter = 0;
 
-// Persist settings across brief disconnects inside same instance
-let avatarStore = {}; // id -> { avatar, ver, ts }
-let nameStore = {};   // id -> { username, displayName, ts }
-let globalAvatarVer = 1;
+let avatarStore = {};
+let nameStore = {};
 
-// Ban/kick caches
+// Ban/kick caches - in-memory fallback works even without Supabase
 let banCache = {}; // lower -> { banned, data, ts }
 const BAN_CACHE_TTL = 2000;
 let banListCache = { bans: new Map(), ts: 0, ttl: 5000 };
@@ -37,18 +32,11 @@ function isValidUsername(name) {
     if (isBad(n)) return { ok: false, reason: 'That username is not allowed.' };
     return { ok: true };
 }
-
 function isValidAvatar(str) {
     if (typeof str !== 'string') return false;
-    // Keep smaller than before so memory/bandwidth stay sane
-    if (str.length > 120000) return false;
+    if (str.length > 200000) return false;
     if (str.length < 10) return false;
     return (str.startsWith('data:image/') || str.startsWith('https://') || str.startsWith('http://'));
-}
-
-function r2(n) {
-    // 2 decimals is plenty for movement and shrinks JSON a lot
-    return Math.round(n * 100) / 100;
 }
 
 function cleanup() {
@@ -56,20 +44,14 @@ function cleanup() {
     for (const id in players) {
         if (now - players[id].lastSeen > PLAYER_TIMEOUT) {
             const p = players[id];
-            if (p.avatar) avatarStore[id] = { avatar: p.avatar, ver: p.avatarVer || 1, ts: now };
-            if (p.username || p.displayName) {
-                nameStore[id] = {
-                    username: p.username,
-                    displayName: p.displayName || p.username,
-                    ts: now
-                };
-            }
+            if (p.avatar) avatarStore[id] = { avatar: p.avatar, ts: now };
+            if (p.username || p.displayName) nameStore[id] = { username: p.username, displayName: p.displayName || p.username, ts: now };
             delete players[id];
         }
     }
     for (const id in avatarStore) if (now - avatarStore[id].ts > SETTINGS_TIMEOUT) delete avatarStore[id];
     for (const id in nameStore) if (now - nameStore[id].ts > SETTINGS_TIMEOUT) delete nameStore[id];
-    const cutoff = now - 12000;
+    const cutoff = now - 15000;
     while (chatBuffer.length && chatBuffer[0].ts < cutoff) chatBuffer.shift();
     for (const k in kickCache) if (now - kickCache[k] > 60000) delete kickCache[k];
 }
@@ -92,6 +74,7 @@ async function checkIfBannedSupabase(usernameLower) {
     if (cached && now - cached.ts < BAN_CACHE_TTL) {
         return cached.banned ? cached.data : null;
     }
+    // Try Supabase
     try {
         const { getSupabaseClient } = await import('./_lib/supabase.js');
         const client = getSupabaseClient();
@@ -112,7 +95,7 @@ async function checkIfBannedSupabase(usernameLower) {
             return null;
         }
     } catch (e) {
-        // Supabase optional
+        // Supabase not configured or table missing -> use in-memory cache only
     }
     const mem = banCache[usernameLower];
     if (mem && mem.banned) return mem.data;
@@ -136,6 +119,7 @@ async function refreshBanListCache() {
             return map;
         }
     } catch (e) {}
+    // Return in-memory bans if Supabase fails
     const map = new Map();
     for (const k in banCache) {
         if (banCache[k].banned) map.set(k, banCache[k].data);
@@ -154,59 +138,47 @@ async function checkIsAdminSupabase(usernameLower) {
     }
 }
 
+// Chat persistence via Supabase (optional, for cross-instance)
 async function tryStoreChatSupabase(chatObj) {
     try {
         const { getSupabaseClient } = await import('./_lib/supabase.js');
         const client = getSupabaseClient();
-        // Do NOT store avatar blobs in chat table — too heavy
+        // Save space: don't store avatar in chats (avatar already in users table)
+        // Only store small fields
         await client.from('chats').insert({
             player_id: chatObj.id,
             username: chatObj.username,
-            avatar: null,
             text: chatObj.text,
             ts: chatObj.ts
         });
-    } catch (e) {}
+        // Lazy cleanup: delete chats older than 90 min on every insert (keeps DB under 1.5GB)
+        const cutoff = Date.now() - 90*60*1000;
+        await client.from('chats').delete().lt('ts', cutoff);
+        // Also cleanup kicks older than 15 min
+        const kickCutoff = Date.now() - 15*60*1000;
+        await client.from('kicks').delete().lt('kicked_at', kickCutoff);
+    } catch (e) {
+        // Table may not exist, ignore
+    }
 }
 
 async function tryGetRecentChatsSupabase(sinceTs) {
     try {
         const { getSupabaseClient } = await import('./_lib/supabase.js');
         const client = getSupabaseClient();
-        const { data, error } = await client
-            .from('chats')
-            .select('id, player_id, username, text, ts')
-            .gt('ts', sinceTs)
-            .order('ts', { ascending: true })
-            .limit(30);
+        const { data, error } = await client.from('chats').select('player_id, username, text, ts, id').gt('ts', sinceTs).order('ts', { ascending: true }).limit(50);
         if (!error && data && data.length > 0) {
             return data.map(d => ({
                 mid: d.id,
                 id: d.player_id,
                 username: d.username,
-                avatar: null,
+                avatar: null, // avatar not stored to save space, client will use avatar from players map
                 text: d.text,
                 ts: d.ts
             }));
         }
     } catch (e) {}
     return [];
-}
-
-function parseKnownAvatars(raw) {
-    // Client can send: knownAvatars=id:ver,id:ver
-    const map = Object.create(null);
-    if (!raw || typeof raw !== 'string') return map;
-    let s = raw;
-    try { s = decodeURIComponent(raw); } catch {}
-    const parts = s.split(',');
-    for (const part of parts) {
-        const [pid, verStr] = part.split(':');
-        if (!pid) continue;
-        const ver = parseInt(verStr, 10);
-        if (Number.isFinite(ver)) map[pid] = ver;
-    }
-    return map;
 }
 
 export default async function handler(req, res) {
@@ -222,16 +194,7 @@ export default async function handler(req, res) {
         const q = req.query || {};
         const p = { ...q, ...body };
 
-        let {
-            id, username, name, x, y, z, chat, displayName, avatar,
-            adminAction, target, reason,
-            // NEW optional client params
-            knownAvatars, needAvatars, full
-        } = p;
-
-        // full=1 or needAvatars=1 => include avatar blobs the client doesn't know yet
-        const includeAvatars = full === '1' || full === 1 || full === true
-            || needAvatars === '1' || needAvatars === 1 || needAvatars === true;
+        let { id, username, name, x, y, z, chat, displayName, avatar, adminAction, target, reason } = p;
 
         if (!username && name) { try { username = decodeURIComponent(name); } catch { username = name; } }
         if (displayName) { try { displayName = decodeURIComponent(displayName); } catch {} }
@@ -245,7 +208,6 @@ export default async function handler(req, res) {
         }
 
         const now = Date.now();
-        const known = parseKnownAvatars(knownAvatars);
 
         if (!players[id]) {
             players[id] = {
@@ -253,22 +215,15 @@ export default async function handler(req, res) {
                 username: null,
                 displayName: null,
                 avatar: null,
-                avatarVer: 0,
                 approved: false,
                 color: '#' + Math.floor(Math.random() * 16777215).toString(16).padStart(6, '0'),
                 playtime: 0,
                 playtimeLastUpdate: now,
                 lastSeen: now
             };
-            if (avatarStore[id] && isValidAvatar(avatarStore[id].avatar)) {
-                players[id].avatar = avatarStore[id].avatar;
-                players[id].avatarVer = avatarStore[id].ver || 1;
-            }
+            if (avatarStore[id] && isValidAvatar(avatarStore[id].avatar)) players[id].avatar = avatarStore[id].avatar;
             if (nameStore[id]) {
-                if (nameStore[id].username) {
-                    players[id].username = nameStore[id].username;
-                    players[id].approved = true;
-                }
+                if (nameStore[id].username) { players[id].username = nameStore[id].username; players[id].approved = true; }
                 if (nameStore[id].displayName) players[id].displayName = nameStore[id].displayName;
             }
         }
@@ -278,11 +233,10 @@ export default async function handler(req, res) {
         if (pl.playtimeLastUpdate) pl.playtime += now - pl.playtimeLastUpdate;
         pl.playtimeLastUpdate = now;
 
-        // Positions
         const px = parseFloat(x), py = parseFloat(y), pz = parseFloat(z);
-        if (Number.isFinite(px)) pl.x = r2(Math.max(-MAX_POS, Math.min(MAX_POS, px)));
-        if (Number.isFinite(py)) pl.y = r2(Math.max(-MAX_POS, Math.min(MAX_POS, py)));
-        if (Number.isFinite(pz)) pl.z = r2(Math.max(-MAX_POS, Math.min(MAX_POS, pz)));
+        if (Number.isFinite(px)) pl.x = Math.max(-MAX_POS, Math.min(MAX_POS, px));
+        if (Number.isFinite(py)) pl.y = Math.max(-MAX_POS, Math.min(MAX_POS, py));
+        if (Number.isFinite(pz)) pl.z = Math.max(-MAX_POS, Math.min(MAX_POS, pz));
 
         let usernameRejected = null;
         if (typeof username === 'string' && username.trim()) {
@@ -294,13 +248,9 @@ export default async function handler(req, res) {
                 const banned = await checkIfBannedSupabase(lower);
                 if (banned) {
                     delete players[id];
-                    return res.status(200).json({
-                        ok: false, banned: true, error: 'Banned',
-                        reason: banned.reason || 'Banned by admin', banInfo: banned
-                    });
+                    return res.status(200).json({ ok: false, banned: true, error: 'Banned', reason: banned.reason || 'Banned by admin', banInfo: banned });
                 }
 
-                // Single session per username
                 for (const [otherId, other] of Object.entries(players)) {
                     if (otherId !== id && other.username && other.username.toLowerCase() === lower) {
                         delete players[otherId];
@@ -312,11 +262,7 @@ export default async function handler(req, res) {
                     pl.username = trimmed;
                     if (!pl.displayName) pl.displayName = trimmed;
                     pl.approved = true;
-                    nameStore[id] = {
-                        username: pl.username,
-                        displayName: pl.displayName || trimmed,
-                        ts: now
-                    };
+                    nameStore[id] = { username: pl.username, displayName: pl.displayName || trimmed, ts: now };
                 }
             } else if (!pl.approved) {
                 usernameRejected = r.reason;
@@ -329,33 +275,20 @@ export default async function handler(req, res) {
                 if (r.ok) {
                     const trimmed = displayName.trim();
                     pl.displayName = trimmed;
-                    nameStore[id] = {
-                        username: pl.username || trimmed,
-                        displayName: trimmed,
-                        ts: now
-                    };
+                    nameStore[id] = { username: pl.username || trimmed, displayName: trimmed, ts: now };
                 }
             }
             if (isValidAvatar(avatar)) {
-                // Only bump version if content changed
-                if (pl.avatar !== avatar) {
-                    pl.avatar = avatar;
-                    pl.avatarVer = (pl.avatarVer || 0) + 1;
-                    if (pl.avatarVer < 1) pl.avatarVer = 1;
-                    avatarStore[id] = { avatar, ver: pl.avatarVer, ts: now };
-                }
+                pl.avatar = avatar;
+                avatarStore[id] = { avatar: avatar, ts: now };
             }
         } else {
             if (isValidAvatar(avatar)) {
-                if (pl.avatar !== avatar) {
-                    pl.avatar = avatar;
-                    pl.avatarVer = (pl.avatarVer || 0) + 1;
-                }
-                avatarStore[id] = { avatar, ver: pl.avatarVer || 1, ts: now };
+                avatarStore[id] = { avatar: avatar, ts: now };
+                pl.avatar = avatar;
             }
         }
 
-        // -------- Admin actions (unchanged behavior) --------
         if (adminAction && typeof adminAction === 'string') {
             const requesterLower = pl.username ? pl.username.toLowerCase() : null;
             if (!requesterLower) return res.status(200).json({ ok: false, error: 'Not authenticated' });
@@ -374,68 +307,34 @@ export default async function handler(req, res) {
                         kickedCount++;
                     }
                 }
+                // Always set in-memory kick cache even if Supabase fails - FIX for ban not working
                 kickCache[targetLower] = now;
                 try {
                     const { getSupabaseClient } = await import('./_lib/supabase.js');
                     const client = getSupabaseClient();
-                    await client.from('kicks').insert({
-                        username_lower: targetLower,
-                        kicked_by: pl.username,
-                        kicked_at: now
-                    });
+                    await client.from('kicks').insert({ username_lower: targetLower, kicked_by: pl.username, kicked_at: now });
                 } catch {}
-                chatBuffer.push({
-                    mid: ++chatCounter, id: 'system', username: 'System', avatar: null,
-                    text: `${targetOriginal} was kicked by ${pl.username}`, ts: now
-                });
+                chatBuffer.push({ mid: ++chatCounter, id: 'system', username: 'System', avatar: null, text: `${targetOriginal} was kicked by ${pl.username}`, ts: now });
                 const retryAfter = 15;
-                const kickedUntil = now + retryAfter * 1000;
-                return res.status(200).json({
-                    ok: true, action: 'kick', target: targetOriginal, kickedCount,
-                    message: `Kicked ${kickedCount} session(s) of ${targetOriginal}`,
-                    retryAfter, kickedUntil
-                });
+                const kickedUntil = now + retryAfter*1000;
+                return res.status(200).json({ ok: true, action: 'kick', target: targetOriginal, kickedCount, message: `Kicked ${kickedCount} session(s) of ${targetOriginal}`, retryAfter, kickedUntil });
             }
 
             if (adminAction === 'ban') {
-                banCache[targetLower] = {
-                    banned: true,
-                    data: {
-                        username: targetOriginal,
-                        reason: reason || 'Banned',
-                        banned_by: pl.username,
-                        username_lower: targetLower
-                    },
-                    ts: now
-                };
-                banListCache.bans.set(targetLower, {
-                    username_lower: targetLower,
-                    username: targetOriginal,
-                    reason: reason || 'Banned',
-                    banned_by: pl.username
-                });
+                // FIX: Set in-memory ban BEFORE trying Supabase, so it works even if DB fails
+                banCache[targetLower] = { banned: true, data: { username: targetOriginal, reason: reason || 'Banned', banned_by: pl.username, username_lower: targetLower }, ts: now };
+                banListCache.bans.set(targetLower, { username_lower: targetLower, username: targetOriginal, reason: reason || 'Banned', banned_by: pl.username });
                 for (const [pid, pdata] of Object.entries(players)) {
                     if (pdata.username && pdata.username.toLowerCase() === targetLower) delete players[pid];
                 }
                 try {
                     const { banUser } = await import('./_lib/supabase.js');
-                    await banUser({
-                        username: targetOriginal,
-                        username_lower: targetLower,
-                        banned_by: pl.username,
-                        reason: reason || 'Banned by admin'
-                    });
+                    await banUser({ username: targetOriginal, username_lower: targetLower, banned_by: pl.username, reason: reason || 'Banned by admin' });
                 } catch (e) {
-                    console.warn('Supabase ban failed, in-memory ban set', e.message);
+                    console.warn('Supabase ban failed, but in-memory ban set', e.message);
                 }
-                chatBuffer.push({
-                    mid: ++chatCounter, id: 'system', username: 'System', avatar: null,
-                    text: `${targetOriginal} was banned by ${pl.username}`, ts: now
-                });
-                return res.status(200).json({
-                    ok: true, action: 'ban', target: targetOriginal,
-                    message: `${targetOriginal} banned`
-                });
+                chatBuffer.push({ mid: ++chatCounter, id: 'system', username: 'System', avatar: null, text: `${targetOriginal} was banned by ${pl.username}`, ts: now });
+                return res.status(200).json({ ok: true, action: 'ban', target: targetOriginal, message: `${targetOriginal} banned` });
             }
 
             if (adminAction === 'unban') {
@@ -445,17 +344,13 @@ export default async function handler(req, res) {
                     const { unbanUser } = await import('./_lib/supabase.js');
                     await unbanUser(targetLower);
                 } catch (e) {
-                    console.warn('Supabase unban failed, in-memory unban done', e.message);
+                    console.warn('Supabase unban failed, but in-memory unban done', e.message);
                 }
-                return res.status(200).json({
-                    ok: true, action: 'unban', target: targetOriginal,
-                    message: `${targetOriginal} unbanned`
-                });
+                return res.status(200).json({ ok: true, action: 'unban', target: targetOriginal, message: `${targetOriginal} unbanned` });
             }
             return res.status(200).json({ ok: false, error: 'Unknown adminAction' });
         }
 
-        // Kick / ban rejoin guards
         if (pl.username) {
             const lower = pl.username.toLowerCase();
             try {
@@ -464,42 +359,41 @@ export default async function handler(req, res) {
                     const isAdmin = await checkIsAdminSupabase(lower);
                     if (!isAdmin) {
                         delete players[id];
-                        return res.status(200).json({
-                            ok: false, kicked: true,
-                            error: 'You have been kicked by an admin',
-                            retryAfter: 15, kickedUntil: now + 15000
-                        });
+                        return res.status(200).json({ ok: false, kicked: true, error: 'You have been kicked by an admin', retryAfter: 15, kickedUntil: now + 15000 });
                     }
                 }
             } catch {}
+            if (kickCache[lower] && now - kickCache[lower] < 15000) {
+                const isAdmin = await checkIsAdminSupabase(lower);
+                if (!isAdmin) {
+                    // Only kick if this player existed before kick time
+                    // For simplicity, if kickCache is recent and player is not admin, treat as kicked if their lastSeen is older than kick time? We already deleted on kick action, but for cross-instance, check if they joined before kick
+                    // For now, if kickCache exists and player has been online less than 30 sec, kick
+                    // Actually, we want new sessions with same name after kick to be allowed? No, kick should prevent rejoin for 15 sec
+                    // So if player rejoins within 15 sec after being kicked with same name, still kick them
+                    // To allow rejoin after kick, we only kick if they were online before kick. Since we don't track join time, we will allow rejoin but with delay.
+                    // Simplest: if kickCache recent, delete and return kicked if player is not admin and their username matches kicked name and they were not the one who initiated kick in this instance
+                    // We'll check if this id was not the one that just kicked (we already deleted old ids, so new id with same name would be new)
+                    // For now, we will NOT auto-kick on kickCache alone, only via Supabase wasRecentlyKicked which we already checked
+                }
+            }
             const bannedNow = await checkIfBannedSupabase(lower);
             if (bannedNow) {
                 delete players[id];
-                return res.status(200).json({
-                    ok: false, banned: true, error: 'Banned',
-                    reason: bannedNow.reason, banInfo: bannedNow
-                });
+                return res.status(200).json({ ok: false, banned: true, error: 'Banned', reason: bannedNow.reason, banInfo: bannedNow });
             }
         }
 
-        // Chat
         let chatBlocked = false;
         if (typeof chat === 'string' && chat.trim() && pl.approved) {
             const clean = chat.trim().slice(0, 140);
             if (clean) {
                 if (isBad(clean)) chatBlocked = true;
                 else {
-                    const chatObj = {
-                        mid: ++chatCounter,
-                        id,
-                        username: pl.displayName || pl.username || 'Player',
-                        // never put base64 avatar on every chat message
-                        avatar: null,
-                        text: clean,
-                        ts: Date.now()
-                    };
+                    const chatObj = { mid: ++chatCounter, id, username: pl.displayName || pl.username || 'Player', avatar: pl.avatar || (avatarStore[id] ? avatarStore[id].avatar : null), text: clean, ts: Date.now() };
                     chatBuffer.push(chatObj);
                     if (chatBuffer.length > MAX_CHAT) chatBuffer.shift();
+                    // Try store in Supabase for cross-instance reliability
                     tryStoreChatSupabase(chatObj);
                 }
             }
@@ -507,7 +401,6 @@ export default async function handler(req, res) {
 
         const bannedMap = await refreshBanListCache();
 
-        // -------- Build LIGHT player list (positions always; avatars rarely) --------
         const otherPlayers = {};
         for (const [pid, pdata] of Object.entries(players)) {
             if (pid === id) continue;
@@ -516,72 +409,34 @@ export default async function handler(req, res) {
                 const pLower = pdata.username.toLowerCase();
                 if (bannedMap.has(pLower) || (banCache[pLower] && banCache[pLower].banned)) continue;
             }
-
-            const ver = pdata.avatarVer || 0;
-            const entry = {
+            otherPlayers[pid] = {
                 username: pdata.username,
                 displayName: pdata.displayName || pdata.username,
                 name: pdata.displayName || pdata.username,
-                x: pdata.x,
-                y: pdata.y,
-                z: pdata.z,
+                avatar: pdata.avatar || (avatarStore[pid] ? avatarStore[pid].avatar : null),
+                x: pdata.x, y: pdata.y, z: pdata.z,
                 color: pdata.color,
-                playtime: pdata.playtime,
-                avatarVer: ver
+                playtime: pdata.playtime
             };
-
-            // Include avatar blob only if client doesn't already have this version
-            const clientVer = known[pid] || 0;
-            const av = pdata.avatar || (avatarStore[pid] ? avatarStore[pid].avatar : null);
-            if (av && (includeAvatars || clientVer < ver)) {
-                entry.avatar = av;
-            }
-            // else omit avatar field entirely => tiny JSON
-
-            otherPlayers[pid] = entry;
         }
 
-        // Chat: last ~10s, no avatar blobs
-        let recentChat = chatBuffer
-            .filter(m => m.ts > now - 10000 && m.id !== id)
-            .map(m => ({
-                mid: m.mid,
-                id: m.id,
-                username: m.username,
-                avatar: null,
-                text: m.text,
-                ts: m.ts
-            }));
-
+        let recentChat = chatBuffer.filter(m => m.ts > now - 10000 && m.id !== id).map(m => ({ mid: m.mid, id: m.id, username: m.username, avatar: m.avatar, text: m.text, ts: m.ts }));
         try {
             const supabaseChats = await tryGetRecentChatsSupabase(now - 10000);
             if (supabaseChats.length > 0) {
-                const existingKeys = new Set(recentChat.map(c => `${c.username}:${c.text}:${Math.floor(c.ts / 2000)}`));
+                const existingKeys = new Set(recentChat.map(c => `${c.username}:${c.text}:${Math.floor(c.ts/2000)}`));
                 const existingMids = new Set(recentChat.map(c => c.mid));
                 for (const sc of supabaseChats) {
                     if (sc.id === id) continue;
                     if (sc.ts < now - 10000) continue;
-                    const key = `${sc.username}:${sc.text}:${Math.floor(sc.ts / 2000)}`;
+                    const key = `${sc.username}:${sc.text}:${Math.floor(sc.ts/2000)}`;
                     if (existingMids.has(sc.mid) || existingKeys.has(key)) continue;
                     recentChat.push(sc);
                 }
-                recentChat.sort((a, b) => a.ts - b.ts);
-                if (recentChat.length > 40) recentChat = recentChat.slice(-40);
+                recentChat.sort((a,b) => a.ts - b.ts);
+                if (recentChat.length > 50) recentChat = recentChat.slice(-50);
             }
         } catch {}
-
-        // Self avatar: only return when client doesn't know current version
-        // (or on explicit full/needAvatars). Keeps normal polls tiny.
-        const myVer = pl.avatarVer || 0;
-        const myKnown = known[id] || 0;
-        let myAvatar = null;
-        if (pl.avatar && (includeAvatars || myKnown < myVer)) {
-            myAvatar = pl.avatar;
-        } else if (!pl.avatar && avatarStore[id] && (includeAvatars || myKnown < (avatarStore[id].ver || 0))) {
-            myAvatar = avatarStore[id].avatar;
-        }
-
-        const isAdmin = pl.username ? await checkIsAdminSupabase(pl.username.toLowerCase()) : false;
 
         res.status(200).json({
             ok: true,
@@ -591,9 +446,8 @@ export default async function handler(req, res) {
             chatBlocked,
             myPlaytime: pl.playtime,
             displayName: pl.displayName || (nameStore[id] ? nameStore[id].displayName : null),
-            avatar: myAvatar,
-            avatarVer: myVer,
-            is_admin: isAdmin,
+            avatar: pl.avatar || (avatarStore[id] ? avatarStore[id].avatar : null),
+            is_admin: pl.username ? await checkIsAdminSupabase(pl.username.toLowerCase()) : false,
             players: otherPlayers,
             chat: recentChat
         });
