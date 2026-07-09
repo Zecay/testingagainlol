@@ -308,7 +308,9 @@ export default async function handler(req, res) {
                     await client.from('kicks').insert({ username_lower: targetLower, kicked_by: pl.username, kicked_at: now });
                 } catch {}
                 chatBuffer.push({ mid: ++chatCounter, id: 'system', username: 'System', avatar: null, text: `${targetOriginal} was kicked by ${pl.username}`, ts: now });
-                return res.status(200).json({ ok: true, action: 'kick', target: targetOriginal, kickedCount, message: `Kicked ${kickedCount} session(s) of ${targetOriginal}` });
+                const retryAfter = 15;
+                const kickedUntil = now + retryAfter*1000;
+                return res.status(200).json({ ok: true, action: 'kick', target: targetOriginal, kickedCount, message: `Kicked ${kickedCount} session(s) of ${targetOriginal}`, retryAfter, kickedUntil });
             }
 
             if (adminAction === 'ban') {
@@ -350,7 +352,7 @@ export default async function handler(req, res) {
                     const isAdmin = await checkIsAdminSupabase(lower);
                     if (!isAdmin) {
                         delete players[id];
-                        return res.status(200).json({ ok: false, kicked: true, error: 'You have been kicked by an admin' });
+                        return res.status(200).json({ ok: false, kicked: true, error: 'You have been kicked by an admin', retryAfter: 15, kickedUntil: now + 15000 });
                     }
                 }
             } catch {}
@@ -411,21 +413,19 @@ export default async function handler(req, res) {
             };
         }
 
-        // Try get chats from Supabase for cross-instance, merge with memory
         let recentChat = chatBuffer.filter(m => m.ts > now - 10000 && m.id !== id).map(m => ({ mid: m.mid, id: m.id, username: m.username, avatar: m.avatar, text: m.text, ts: m.ts }));
         try {
             const supabaseChats = await tryGetRecentChatsSupabase(now - 10000);
             if (supabaseChats.length > 0) {
-                // Merge, filter out own id and dedup by mid
+                const existingKeys = new Set(recentChat.map(c => `${c.username}:${c.text}:${Math.floor(c.ts/2000)}`));
                 const existingMids = new Set(recentChat.map(c => c.mid));
                 for (const sc of supabaseChats) {
                     if (sc.id === id) continue;
                     if (sc.ts < now - 10000) continue;
-                    if (!existingMids.has(sc.mid)) {
-                        recentChat.push(sc);
-                    }
+                    const key = `${sc.username}:${sc.text}:${Math.floor(sc.ts/2000)}`;
+                    if (existingMids.has(sc.mid) || existingKeys.has(key)) continue;
+                    recentChat.push(sc);
                 }
-                // Sort by ts
                 recentChat.sort((a,b) => a.ts - b.ts);
                 if (recentChat.length > 50) recentChat = recentChat.slice(-50);
             }
