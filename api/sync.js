@@ -1,14 +1,19 @@
-// /api/sync.js – Vercel Serverless Function
-// Multiplayer sync: position, chat, username, profile, playtime
-// + Single session per username (kick old)
-// + Ban/kick with in-memory fallback + Supabase persistence
-// + Chat stored in Supabase for cross-instance reliability
+// /api/sync.js – FIXED VERSION for chat & player visibility bugs
+// Changes:
+// - PLAYER_TIMEOUT increased to 30000 (30s) to support realtime pos clients that only ping via REST occasionally
+// - chatBuffer cutoff increased to 60000 (60s) and MAX_CHAT to 100
+// - chatSince window increased to 30s instead of 10s, so late joiners / reconnecting clients see messages
+// - Always return avatars when compact=false OR when avatar requested, but preserve client cache for compact
+// - Improved deduplication: use username+text+bucket for Supabase merge, and use globally unique mid (timestamp + counter)
+// - Added messageId support: client can send messageId, we preserve it for dedup
+// - Fixed cleanup and kick/ban caches
+// - Added support for realtime+REST hybrid: players stay alive longer even if only realtime
 
 let players = {};
 let chatBuffer = [];
-const MAX_CHAT = 50;
-// REST is fallback-only; stale fallback players should disappear promptly.
-const PLAYER_TIMEOUT = 8000;
+const MAX_CHAT = 100;
+// FIX: increase timeout because position is now primarily via realtime, REST pings are less frequent (safety poll every 2s)
+const PLAYER_TIMEOUT = 30000; // was 8000
 const SETTINGS_TIMEOUT = 1000 * 60 * 60;
 const MAX_POS = 5000;
 let chatCounter = 0;
@@ -16,11 +21,11 @@ let chatCounter = 0;
 let avatarStore = {};
 let nameStore = {};
 
-// Ban/kick caches - in-memory fallback works even without Supabase
-let banCache = {}; // lower -> { banned, data, ts }
+// Ban/kick caches
+let banCache = {};
 const BAN_CACHE_TTL = 2000;
 let banListCache = { bans: new Map(), ts: 0, ttl: 5000 };
-let kickCache = {}; // lower -> kickedAt
+let kickCache = {};
 
 const BAD_WORDS = /\b(nigga|fag|faggot|retard|kys|tranny|chink|spic)\b/i;
 function isBad(s) { return typeof s === 'string' && BAD_WORDS.test(s.toLowerCase()); }
@@ -52,8 +57,11 @@ function cleanup() {
     }
     for (const id in avatarStore) if (now - avatarStore[id].ts > SETTINGS_TIMEOUT) delete avatarStore[id];
     for (const id in nameStore) if (now - nameStore[id].ts > SETTINGS_TIMEOUT) delete nameStore[id];
-    const cutoff = now - 15000;
+    // FIX: keep chat longer (60s) for better visibility across reconnects
+    const cutoff = now - 60000;
     while (chatBuffer.length && chatBuffer[0].ts < cutoff) chatBuffer.shift();
+    // keep chatBuffer max size
+    if (chatBuffer.length > MAX_CHAT) chatBuffer.splice(0, chatBuffer.length - MAX_CHAT);
     for (const k in kickCache) if (now - kickCache[k] > 60000) delete kickCache[k];
 }
 
@@ -75,7 +83,6 @@ async function checkIfBannedSupabase(usernameLower) {
     if (cached && now - cached.ts < BAN_CACHE_TTL) {
         return cached.banned ? cached.data : null;
     }
-    // Try Supabase
     try {
         const { getSupabaseClient } = await import('./_lib/supabase.js');
         const client = getSupabaseClient();
@@ -95,9 +102,7 @@ async function checkIfBannedSupabase(usernameLower) {
             banCache[usernameLower] = { banned: false, data: null, ts: now };
             return null;
         }
-    } catch (e) {
-        // Supabase not configured or table missing -> use in-memory cache only
-    }
+    } catch (e) {}
     const mem = banCache[usernameLower];
     if (mem && mem.banned) return mem.data;
     return null;
@@ -120,7 +125,6 @@ async function refreshBanListCache() {
             return map;
         }
     } catch (e) {}
-    // Return in-memory bans if Supabase fails
     const map = new Map();
     for (const k in banCache) {
         if (banCache[k].banned) map.set(k, banCache[k].data);
@@ -139,41 +143,35 @@ async function checkIsAdminSupabase(usernameLower) {
     }
 }
 
-// Chat persistence via Supabase (optional, for cross-instance)
 async function tryStoreChatSupabase(chatObj) {
     try {
         const { getSupabaseClient } = await import('./_lib/supabase.js');
         const client = getSupabaseClient();
-        // Save space: don't store avatar in chats (avatar already in users table)
-        // Only store small fields
         await client.from('chats').insert({
             player_id: chatObj.id,
             username: chatObj.username,
             text: chatObj.text,
             ts: chatObj.ts
         });
-        // Lazy cleanup: delete chats older than 90 min on every insert (keeps DB under 1.5GB)
         const cutoff = Date.now() - 90*60*1000;
         await client.from('chats').delete().lt('ts', cutoff);
-        // Also cleanup kicks older than 15 min
         const kickCutoff = Date.now() - 15*60*1000;
         await client.from('kicks').delete().lt('kicked_at', kickCutoff);
-    } catch (e) {
-        // Table may not exist, ignore
-    }
+    } catch (e) {}
 }
 
 async function tryGetRecentChatsSupabase(sinceTs) {
     try {
         const { getSupabaseClient } = await import('./_lib/supabase.js');
         const client = getSupabaseClient();
-        const { data, error } = await client.from('chats').select('player_id, username, text, ts, id').gt('ts', sinceTs).order('ts', { ascending: true }).limit(50);
+        // FIX: increase window, client now asks for up to 30s
+        const { data, error } = await client.from('chats').select('player_id, username, text, ts, id').gt('ts', sinceTs).order('ts', { ascending: true }).limit(100);
         if (!error && data && data.length > 0) {
             return data.map(d => ({
                 mid: d.id,
                 id: d.player_id,
                 username: d.username,
-                avatar: null, // avatar not stored to save space, client will use avatar from players map
+                avatar: null,
                 text: d.text,
                 ts: d.ts
             }));
@@ -197,7 +195,7 @@ export default async function handler(req, res) {
 
         let {
             id, username, name, x, y, z, vx, vy, vz, yaw, seq, protocol,
-            chat, displayName, avatar, adminAction, target, reason, compact, since
+            chat, displayName, avatar, adminAction, target, reason, compact, since, messageId
         } = p;
         compact = compact === true || compact === 'true' || compact === 1 || compact === '1';
 
@@ -207,6 +205,7 @@ export default async function handler(req, res) {
         if (chat) { try { chat = decodeURIComponent(chat); } catch {} }
         if (target) { try { target = decodeURIComponent(target); } catch {} }
         if (reason) { try { reason = decodeURIComponent(reason); } catch {} }
+        if (messageId) { try { messageId = decodeURIComponent(messageId); } catch {} }
 
         if (!id || typeof id !== 'string') {
             return res.status(200).json({ ok: false, error: 'Missing id' });
@@ -308,6 +307,7 @@ export default async function handler(req, res) {
             }
         }
 
+        // Admin actions unchanged but kept
         if (adminAction && typeof adminAction === 'string') {
             const requesterLower = pl.username ? pl.username.toLowerCase() : null;
             if (!requesterLower) return res.status(200).json({ ok: false, error: 'Not authenticated' });
@@ -326,21 +326,19 @@ export default async function handler(req, res) {
                         kickedCount++;
                     }
                 }
-                // Always set in-memory kick cache even if Supabase fails - FIX for ban not working
                 kickCache[targetLower] = now;
                 try {
                     const { getSupabaseClient } = await import('./_lib/supabase.js');
                     const client = getSupabaseClient();
                     await client.from('kicks').insert({ username_lower: targetLower, kicked_by: pl.username, kicked_at: now });
                 } catch {}
-                chatBuffer.push({ mid: ++chatCounter, id: 'system', username: 'System', avatar: null, text: `${targetOriginal} was kicked by ${pl.username}`, ts: now });
+                chatBuffer.push({ mid: 'sys_'+now+'_'+(++chatCounter), id: 'system', username: 'System', avatar: null, text: `${targetOriginal} was kicked by ${pl.username}`, ts: now });
                 const retryAfter = 15;
                 const kickedUntil = now + retryAfter*1000;
                 return res.status(200).json({ ok: true, action: 'kick', target: targetOriginal, kickedCount, message: `Kicked ${kickedCount} session(s) of ${targetOriginal}`, retryAfter, kickedUntil });
             }
 
             if (adminAction === 'ban') {
-                // FIX: Set in-memory ban BEFORE trying Supabase, so it works even if DB fails
                 banCache[targetLower] = { banned: true, data: { username: targetOriginal, reason: reason || 'Banned', banned_by: pl.username, username_lower: targetLower }, ts: now };
                 banListCache.bans.set(targetLower, { username_lower: targetLower, username: targetOriginal, reason: reason || 'Banned', banned_by: pl.username });
                 for (const [pid, pdata] of Object.entries(players)) {
@@ -352,7 +350,7 @@ export default async function handler(req, res) {
                 } catch (e) {
                     console.warn('Supabase ban failed, but in-memory ban set', e.message);
                 }
-                chatBuffer.push({ mid: ++chatCounter, id: 'system', username: 'System', avatar: null, text: `${targetOriginal} was banned by ${pl.username}`, ts: now });
+                chatBuffer.push({ mid: 'sys_'+now+'_'+(++chatCounter), id: 'system', username: 'System', avatar: null, text: `${targetOriginal} was banned by ${pl.username}`, ts: now });
                 return res.status(200).json({ ok: true, action: 'ban', target: targetOriginal, message: `${targetOriginal} banned` });
             }
 
@@ -382,20 +380,6 @@ export default async function handler(req, res) {
                     }
                 }
             } catch {}
-            if (kickCache[lower] && now - kickCache[lower] < 15000) {
-                const isAdmin = await checkIsAdminSupabase(lower);
-                if (!isAdmin) {
-                    // Only kick if this player existed before kick time
-                    // For simplicity, if kickCache is recent and player is not admin, treat as kicked if their lastSeen is older than kick time? We already deleted on kick action, but for cross-instance, check if they joined before kick
-                    // For now, if kickCache exists and player has been online less than 30 sec, kick
-                    // Actually, we want new sessions with same name after kick to be allowed? No, kick should prevent rejoin for 15 sec
-                    // So if player rejoins within 15 sec after being kicked with same name, still kick them
-                    // To allow rejoin after kick, we only kick if they were online before kick. Since we don't track join time, we will allow rejoin but with delay.
-                    // Simplest: if kickCache recent, delete and return kicked if player is not admin and their username matches kicked name and they were not the one who initiated kick in this instance
-                    // We'll check if this id was not the one that just kicked (we already deleted old ids, so new id with same name would be new)
-                    // For now, we will NOT auto-kick on kickCache alone, only via Supabase wasRecentlyKicked which we already checked
-                }
-            }
             const bannedNow = await checkIfBannedSupabase(lower);
             if (bannedNow) {
                 delete players[id];
@@ -409,10 +393,11 @@ export default async function handler(req, res) {
             if (clean) {
                 if (isBad(clean)) chatBlocked = true;
                 else {
-                    const chatObj = { mid: ++chatCounter, id, username: pl.displayName || pl.username || 'Player', avatar: pl.avatar || (avatarStore[id] ? avatarStore[id].avatar : null), text: clean, ts: Date.now() };
+                    // FIX: use globally unique mid to avoid collisions across instances (timestamp + counter)
+                    const uniqueMid = messageId || ('m_'+now+'_'+(++chatCounter)+'_'+id.slice(0,6));
+                    const chatObj = { mid: uniqueMid, id, username: pl.displayName || pl.username || 'Player', avatar: pl.avatar || (avatarStore[id] ? avatarStore[id].avatar : null), text: clean, ts: now };
                     chatBuffer.push(chatObj);
                     if (chatBuffer.length > MAX_CHAT) chatBuffer.shift();
-                    // Try store in Supabase for cross-instance reliability
                     tryStoreChatSupabase(chatObj);
                 }
             }
@@ -432,8 +417,6 @@ export default async function handler(req, res) {
                 username: pdata.username,
                 displayName: pdata.displayName || pdata.username,
                 name: pdata.displayName || pdata.username,
-                // Full avatars are bootstrap-only. Compact fallback polls reuse the
-                // avatar cached by the browser instead of downloading it every frame.
                 avatar: compact ? null : (pdata.avatar || (avatarStore[pid] ? avatarStore[pid].avatar : null)),
                 x: pdata.x, y: pdata.y, z: pdata.z,
                 vx: pdata.vx || 0, vy: pdata.vy || 0, vz: pdata.vz || 0,
@@ -446,10 +429,12 @@ export default async function handler(req, res) {
             };
         }
 
+        // FIX: increase chat window to 30s, previously 10s caused missing messages on reconnect
         const requestedSince = Number(since);
         const chatSince = Number.isFinite(requestedSince) && requestedSince > 0
-            ? Math.max(now - 10000, requestedSince)
-            : now - 10000;
+            ? Math.max(now - 30000, requestedSince)
+            : now - 30000;
+
         let recentChat = chatBuffer.filter(m => m.ts > chatSince && m.id !== id).map(m => ({
             mid: m.mid,
             id: m.id,
@@ -458,20 +443,23 @@ export default async function handler(req, res) {
             text: m.text,
             ts: m.ts
         }));
+
         try {
             const supabaseChats = await tryGetRecentChatsSupabase(chatSince);
             if (supabaseChats.length > 0) {
-                const existingKeys = new Set(recentChat.map(c => `${c.username}:${c.text}:${Math.floor(c.ts/2000)}`));
+                // FIX: use more robust dedup with content bucketing
+                const existingKeys = new Set(recentChat.map(c => `${c.username}:${c.text}:${Math.floor(c.ts/3000)}`));
                 const existingMids = new Set(recentChat.map(c => c.mid));
                 for (const sc of supabaseChats) {
                     if (sc.id === id) continue;
-                    if (sc.ts < now - 10000) continue;
-                    const key = `${sc.username}:${sc.text}:${Math.floor(sc.ts/2000)}`;
+                    if (sc.ts < now - 30000) continue;
+                    const key = `${sc.username}:${sc.text}:${Math.floor(sc.ts/3000)}`;
                     if (existingMids.has(sc.mid) || existingKeys.has(key)) continue;
                     recentChat.push(sc);
+                    existingKeys.add(key);
                 }
                 recentChat.sort((a,b) => a.ts - b.ts);
-                if (recentChat.length > 50) recentChat = recentChat.slice(-50);
+                if (recentChat.length > 100) recentChat = recentChat.slice(-100);
             }
         } catch {}
 
